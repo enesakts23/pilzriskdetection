@@ -8,6 +8,9 @@ import os
 from datetime import datetime
 from filterpy.kalman import KalmanFilter
 from scipy.signal import savgol_filter
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from PIL import Image, ImageTk
 
 class KalmanTracker:
     def __init__(self, x, y):
@@ -255,6 +258,12 @@ class MotionAnalyzer:
         self.motion_mask = None
         self.machine_type = "UNKNOWN"
         
+        # New variables for motion tracking
+        self.last_known_motion = "BELİRSİZ"
+        self.motion_counts = Counter()
+        self.most_frequent_motion = None
+        self.most_frequent_motion_frame = None
+        
     def _preprocess_frame(self, frame):
         """Frame preprocessing"""
         blurred = cv2.GaussianBlur(frame, (5, 5), 0)
@@ -414,6 +423,20 @@ class MotionAnalyzer:
                 
         if motion_info is not None:
             direction = motion_info['direction']
+            
+            # Update motion tracking
+            if direction != "UNCERTAIN" and direction != "UNKNOWN":
+                self.last_known_motion = direction
+                self.motion_counts[direction] += 1
+                
+                # Update most frequent motion
+                if self.motion_counts[direction] > self.motion_counts.get(self.most_frequent_motion, 0):
+                    self.most_frequent_motion = direction
+                    # Save frame for most frequent motion
+                    self.most_frequent_motion_frame = frame.copy()
+                    # Save the image
+                    self._save_most_frequent_motion()
+            
             self.history.append(direction)
             
         self.motion_mask = motion_mask
@@ -421,6 +444,129 @@ class MotionAnalyzer:
         self.current_frame = frame
         
         return motion_info
+        
+    def _save_most_frequent_motion(self):
+        """Save the frame with the most frequent motion and highlight significant moving regions"""
+        if self.most_frequent_motion and self.most_frequent_motion_frame is not None:
+            # Create a copy of the frame
+            save_frame = self.most_frequent_motion_frame.copy()
+            
+            # Process the frame to detect motion
+            processed = self._preprocess_frame(save_frame)
+            current_gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
+            
+            # If prev_gray is not set, initialize it
+            if self.prev_gray is None:
+                self.prev_gray = current_gray
+                return
+            
+            # Calculate dense optical flow
+            flow = cv2.calcOpticalFlowFarneback(
+                self.prev_gray, 
+                current_gray,
+                None, 
+                **self.dense_flow_params
+            )
+            
+            # Calculate flow magnitude
+            magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+            
+            # Normalize magnitude to 0-255 range
+            magnitude_norm = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            
+            # Apply threshold to get significant motion areas
+            _, magnitude_mask = cv2.threshold(magnitude_norm, 30, 255, cv2.THRESH_BINARY)
+            
+            # Create motion mask if not available
+            if self.motion_mask is None:
+                self.motion_mask = self.bg_subtractor.apply(processed)
+            
+            # Combine with motion mask for better accuracy
+            motion_mask = self.motion_mask.copy()
+            combined_mask = cv2.bitwise_and(motion_mask, magnitude_mask)
+            
+            # Apply morphological operations to clean up the mask
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
+            combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
+            
+            # Find contours in the combined mask
+            contours, _ = cv2.findContours(
+                combined_mask,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE
+            )
+            
+            # Create an empty mask for significant motion
+            significant_motion_mask = np.zeros_like(combined_mask)
+            
+            # Filter and process contours
+            if contours:
+                # Calculate average magnitude for each contour
+                contour_info = []
+                for contour in contours:
+                    area = cv2.contourArea(contour)
+                    if area > self.min_area:
+                        # Create mask for this contour
+                        contour_mask = np.zeros_like(combined_mask)
+                        cv2.drawContours(contour_mask, [contour], -1, 255, -1)
+                        
+                        # Calculate average magnitude in this contour
+                        mean_magnitude = cv2.mean(magnitude, mask=contour_mask)[0]
+                        contour_info.append((contour, area, mean_magnitude))
+                
+                if contour_info:
+                    # Sort contours by magnitude
+                    contour_info.sort(key=lambda x: x[2], reverse=True)
+                    
+                    # Take the top 3 contours with highest magnitude
+                    for contour, area, _ in contour_info[:3]:
+                        cv2.drawContours(significant_motion_mask, [contour], -1, 255, -1)
+            
+            # Create a colored overlay for the significant moving regions
+            overlay = save_frame.copy()
+            overlay[significant_motion_mask > 0] = [0, 255, 0]  # Green color for moving parts
+            
+            # Blend the original frame with the overlay
+            alpha = 0.4  # Transparency for visibility
+            save_frame = cv2.addWeighted(overlay, alpha, save_frame, 1 - alpha, 0)
+            
+            # Draw motion type text with background for better visibility
+            text = f"Motion Type: {self.most_frequent_motion}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 1.0
+            thickness = 2
+            color = (0, 255, 0)  # Green color
+            
+            # Get text size
+            (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+            
+            # Calculate text position (top-left corner)
+            x = 10
+            y = 40
+            
+            # Draw black background rectangle for text
+            cv2.rectangle(save_frame, 
+                        (x - 5, y - text_height - 5),
+                        (x + text_width + 5, y + 5),
+                        (0, 0, 0),
+                        -1)
+            
+            # Draw text
+            cv2.putText(save_frame,
+                       text,
+                       (x, y),
+                       font,
+                       font_scale,
+                       color,
+                       thickness)
+            
+            # Update prev_gray for next frame
+            self.prev_gray = current_gray
+            
+            # Save the modified frame
+            filename = os.path.join(self.save_dir, "most_frequent_motion.jpg")
+            cv2.imwrite(filename, save_frame)
         
     def get_visualization(self):
         """Visualization"""
@@ -430,9 +576,16 @@ class MotionAnalyzer:
         vis = self.current_frame.copy()
         
         if len(self.history) > 0:
+            current_motion = self.history[-1]
+            display_motion = current_motion
+            
+            # If motion is unknown/uncertain, use last known motion
+            if current_motion in ["UNCERTAIN", "UNKNOWN"]:
+                display_motion = self.last_known_motion
+            
             cv2.putText(
                 vis,
-                f"Motion: {self.history[-1]}",
+                f"Motion: {display_motion}",
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1.0,
