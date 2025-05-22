@@ -2,14 +2,13 @@ import cv2
 import numpy as np
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from utils import calculate_motion_direction, draw_motion_box, MotionTracker
-from collections import Counter
+from utils import draw_motion_box, MotionTracker
 
 class VideoAnalyzerGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Makine Hareketi Tespit Sistemi")
-        self.root.geometry("500x300")
+        self.root.geometry("600x400")
         
         # Ana frame
         self.main_frame = tk.Frame(self.root, padx=20, pady=20)
@@ -22,6 +21,32 @@ class VideoAnalyzerGUI:
             font=('Helvetica', 14, 'bold')
         )
         title_label.pack(pady=(0, 20))
+        
+        # Model Seçimi
+        model_frame = tk.Frame(self.main_frame)
+        model_frame.pack(fill='x', pady=10)
+        
+        tk.Label(model_frame, text="Tespit Modeli:").pack(side='left')
+        self.model_var = tk.StringVar(value='optical_flow')
+        models = [
+            ('Optik Akış', 'optical_flow'),
+            ('YOLO11-n', 'yolo11n'),
+            ('YOLO11-s', 'yolo11s'),
+            ('YOLO11-m', 'yolo11m'),
+            ('YOLO11-l', 'yolo11l'),
+            ('YOLO11-x', 'yolo11x')
+        ]
+        
+        model_select = ttk.Frame(model_frame)
+        model_select.pack(side='left', padx=10)
+        
+        for text, value in models:
+            ttk.Radiobutton(
+                model_select,
+                text=text,
+                value=value,
+                variable=self.model_var
+            ).pack(side='left', padx=5)
         
         # FPS Kontrolü
         fps_frame = tk.Frame(self.main_frame)
@@ -36,6 +61,20 @@ class VideoAnalyzerGUI:
         )
         self.fps_scale.set(30)  # Varsayılan FPS
         self.fps_scale.pack(side='left', fill='x', expand=True, padx=10)
+        
+        # Hassasiyet Kontrolü
+        sensitivity_frame = tk.Frame(self.main_frame)
+        sensitivity_frame.pack(fill='x', pady=10)
+        
+        tk.Label(sensitivity_frame, text="Hassasiyet:").pack(side='left')
+        self.sensitivity_scale = ttk.Scale(
+            sensitivity_frame,
+            from_=0.1,
+            to=1.0,
+            orient='horizontal'
+        )
+        self.sensitivity_scale.set(0.25)  # Varsayılan hassasiyet
+        self.sensitivity_scale.pack(side='left', fill='x', expand=True, padx=10)
         
         # Video seçme butonu
         self.select_button = tk.Button(
@@ -81,96 +120,44 @@ class VideoAnalyzerGUI:
             self.analyze_video(file_path)
     
     def analyze_video(self, video_path):
-        """
-        Video üzerinde hareket analizi yapar
-        """
-        # Video yakalama
+        """Video üzerinde hareket analizi yapar"""
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             messagebox.showerror("Hata", "Video açılamadı!")
             return
-
-        # İlk kareyi al
-        ret, frame1 = cap.read()
-        if not ret:
-            messagebox.showerror("Hata", "Video karesi okunamadı!")
-            return
-
-        # Gri tonlamaya çevir
-        gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
-
-        # Lucas-Kanade optik akış parametreleri
-        lk_params = dict(
-            winSize=(15, 15),
-            maxLevel=2,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
+        
+        # Seçilen modele göre hareket takipçisi oluştur
+        motion_tracker = MotionTracker(
+            model_type=self.model_var.get(),
+            history_size=15
         )
-
-        # Köşe noktası tespit parametreleri
-        feature_params = dict(
-            maxCorners=200,
-            qualityLevel=0.3,
-            minDistance=7,
-            blockSize=7
-        )
-
-        # İlk karede köşe noktalarını bul
-        p0 = cv2.goodFeaturesToTrack(gray1, mask=None, **feature_params)
-        if p0 is None:
-            messagebox.showerror("Hata", "Takip edilecek nokta bulunamadı!")
-            return
-
-        # Hareket takipçisi
-        motion_tracker = MotionTracker(history_size=15)
+        motion_tracker.confidence_threshold = self.sensitivity_scale.get()
+        
         last_frame = None
         last_direction = "BELİRSİZ"
-
+        
         while True:
-            ret, frame2 = cap.read()
+            ret, frame = cap.read()
             if not ret:
                 break
-
-            gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
-
-            # Optik akış hesapla
-            p1, st, err = cv2.calcOpticalFlowPyrLK(gray1, gray2, p0, None, **lk_params)
-
-            # İyi noktaları seç
-            good_new = p1[st == 1]
-            good_old = p0[st == 1]
-
-            # Hareket vektörlerini hesapla
-            motion_vectors = good_new - good_old
-
-            # Anlık hareket yönünü belirle
-            instant_direction = calculate_motion_direction(motion_vectors)
             
-            # Hareket geçmişine ekle
-            motion_tracker.add_motion(instant_direction)
+            # Hareket analizi
+            detections = motion_tracker.detect_motion(frame)
             
-            # Baskın hareket yönünü al
-            dominant_direction = motion_tracker.get_dominant_motion()
-            
-            # Güven oranını hesapla
-            confidence = Counter(motion_tracker.history)[dominant_direction] / len(motion_tracker.history)
-
             # Görüntüyü işaretle
-            frame_with_box = draw_motion_box(frame2.copy(), good_new, dominant_direction, confidence)
-            last_frame = frame_with_box.copy()
-            last_direction = dominant_direction
-
+            if detections:
+                frame = draw_motion_box(frame, detections)
+                last_direction = motion_tracker.get_dominant_motion()
+            
             # Görüntüyü göster
-            cv2.imshow('Makine Hareketi Tespiti', frame_with_box)
-
-            # Sonraki kare için hazırlık
-            gray1 = gray2.copy()
-            p0 = good_new.reshape(-1, 1, 2)
-
+            cv2.imshow('Makine Hareketi Tespiti', frame)
+            last_frame = frame.copy()
+            
             # FPS kontrolü
-            delay = int(1000 / self.fps_scale.get())  # milisaniye cinsinden bekleme süresi
-            if cv2.waitKey(delay) & 0xFF == 27:
+            delay = int(1000 / self.fps_scale.get())
+            if cv2.waitKey(delay) & 0xFF == 27:  # ESC tuşu
                 break
-
+        
         cap.release()
         
         # Son tespit edilen hareketi göster
