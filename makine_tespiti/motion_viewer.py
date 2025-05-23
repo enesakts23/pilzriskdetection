@@ -12,8 +12,10 @@ class MotionViewer:
         self.root = tk.Tk()
         self.root.title("Makine Hareket Analizi")
         
-        # Ana pencere boyutunu ayarla
-        self.root.geometry("1024x768")
+        # Pencereyi ekranın ortasında başlat
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        self.root.geometry(f"{screen_width}x{screen_height}")
         
         # Analiz motoru
         self.analyzer = MotionAnalyzer()
@@ -24,79 +26,91 @@ class MotionViewer:
         self.video_path = None
         self.frame_count = 0
         self.current_frame = 0
+        self.original_video_size = (0, 0)
         
         # GUI bileşenleri
         self._setup_gui()
         
     def _setup_gui(self):
+        # Ana container
+        self.main_container = ttk.Frame(self.root)
+        self.main_container.pack(fill=tk.BOTH, expand=True)
+        
+        # Video container (scrollable)
+        self.canvas = tk.Canvas(self.main_container)
+        self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        
+        # Video frame
+        self.video_frame = ttk.Frame(self.canvas)
+        self.canvas.create_window((0, 0), window=self.video_frame, anchor="nw")
+        
+        # Scrollbars
+        self.h_scrollbar = ttk.Scrollbar(self.main_container, orient=tk.HORIZONTAL, command=self.canvas.xview)
+        self.v_scrollbar = ttk.Scrollbar(self.main_container, orient=tk.VERTICAL, command=self.canvas.yview)
+        self.h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.canvas.configure(xscrollcommand=self.h_scrollbar.set, yscrollcommand=self.v_scrollbar.set)
+        
+        # Video panel
+        self.panel = ttk.Label(self.video_frame)
+        self.panel.pack(padx=0, pady=0)
+        
         # Kontrol paneli
         control_frame = ttk.Frame(self.root)
-        control_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+        control_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
         
         # Video seçme düğmesi
-        self.select_button = ttk.Button(
-            control_frame, text="Video Seç", command=self._select_video
-        )
+        self.select_button = ttk.Button(control_frame, text="Video Seç", command=self._select_video)
         self.select_button.pack(side=tk.LEFT, padx=5)
         
         # Başlat/Durdur düğmesi
-        self.start_button = ttk.Button(
-            control_frame, text="Başlat", command=self._toggle_capture
-        )
+        self.start_button = ttk.Button(control_frame, text="Başlat", command=self._toggle_capture)
         self.start_button.pack(side=tk.LEFT, padx=5)
         self.start_button["state"] = "disabled"
         
         # Video ilerleme çubuğu
         self.progress_var = tk.DoubleVar(value=0)
-        self.progress = ttk.Scale(
-            control_frame,
-            from_=0,
-            to=100,
-            orient=tk.HORIZONTAL,
-            variable=self.progress_var,
-            command=self._on_progress_change
-        )
+        self.progress = ttk.Scale(control_frame, from_=0, to=100, orient=tk.HORIZONTAL,
+                                variable=self.progress_var, command=self._on_progress_change)
         self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         
         # Video bilgisi
         self.info_label = ttk.Label(control_frame, text="Video seçilmedi")
         self.info_label.pack(side=tk.LEFT, padx=5)
         
-        # Görüntü paneli
-        self.panel = ttk.Label(self.root)
-        self.panel.pack(expand=True, fill=tk.BOTH, padx=5, pady=5)
+        # Bind resize event
+        self.video_frame.bind('<Configure>', self._on_frame_configure)
         
-        # Pencere kapatma olayını yakala
-        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+    def _on_frame_configure(self, event=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         
     def _select_video(self):
-        # Video dosyası seç
         video_path = filedialog.askopenfilename(
             title="Video Seç",
-            filetypes=[
-                ("Video dosyaları", "*.mp4 *.avi *.mkv *.mov"),
-                ("Tüm dosyalar", "*.*")
-            ]
+            filetypes=[("Video dosyaları", "*.mp4 *.avi *.mkv *.mov"), ("Tüm dosyalar", "*.*")]
         )
         
         if video_path:
             try:
-                # Video dosyasını aç
                 cap = cv2.VideoCapture(video_path)
                 if not cap.isOpened():
                     raise ValueError("Video dosyası açılamadı!")
-                    
+                
                 # Video bilgilerini al
                 self.frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
                 fps = cap.get(cv2.CAP_PROP_FPS)
                 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 
-                # Bilgileri göster
+                # Orijinal video boyutunu sakla
+                self.original_video_size = (width, height)
+                
+                # Video bilgilerini göster
                 duration = self.frame_count / fps
                 self.info_label["text"] = f"{os.path.basename(video_path)} - {width}x{height}, {fps:.1f}fps, {duration:.1f}s"
                 
-                # Video yolu kaydet
+                # Video yolunu kaydet
                 self.video_path = video_path
                 self.current_frame = 0
                 
@@ -111,18 +125,73 @@ class MotionViewer:
             except Exception as e:
                 messagebox.showerror("Hata", str(e))
                 
+    def _update_gui(self):
+        if self.is_running:
+            # Görselleştirmeyi al
+            vis = self.analyzer.get_visualization()
+            
+            if vis is not None:
+                # OpenCV BGR -> RGB
+                rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+                
+                # Orijinal boyutta göster, kesinlikle yeniden boyutlandırma yapma
+                image = Image.fromarray(rgb)
+                photo = ImageTk.PhotoImage(image)
+                
+                # Görüntüyü güncelle
+                self.panel.configure(image=photo)
+                self.panel.image = photo
+                
+                # Canvas scroll bölgesini güncelle
+                self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            
+            # Video FPS'ine göre güncelle
+            if hasattr(self, 'cap'):
+                fps = self.cap.get(cv2.CAP_PROP_FPS)
+                if fps <= 0:  # Geçersiz FPS değeri durumunda
+                    fps = 30.0
+                update_delay = int(1000.0 / fps)  # ms cinsinden delay
+                self.root.after(update_delay, self._update_gui)
+            else:
+                self.root.after(33, self._update_gui)  # Yaklaşık 30 FPS
+                
+    def _capture_loop(self):
+        while self.is_running:
+            if self.cap is not None and self.cap.isOpened():
+                ret, frame = self.cap.read()
+                if not ret:
+                    # Video bittiğinde başa sar
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
+                
+                # Frame'i analiz motoruna gönder
+                self.analyzer.add_frame(frame)
+                
+                # İlerlemeyi güncelle
+                self.current_frame = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+                progress = (self.current_frame / self.frame_count) * 100
+                self.progress_var.set(progress)
+                
+                # FPS kontrolü
+                if hasattr(self, 'cap'):
+                    fps = self.cap.get(cv2.CAP_PROP_FPS)
+                    if fps <= 0:
+                        fps = 30.0
+                    time.sleep(1.0 / fps)
+            else:
+                time.sleep(0.001)
+                
     def _toggle_capture(self):
         if not self.is_running:
             try:
-                # Video dosyasını aç
                 self.cap = cv2.VideoCapture(self.video_path)
                 if not self.cap.isOpened():
                     raise ValueError("Video dosyası açılamadı!")
-                    
+                
                 # İstenen frame'e git
                 if self.current_frame > 0:
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
-                    
+                
                 # Analiz motorunu başlat
                 self.analyzer.start_processing()
                 
@@ -146,52 +215,12 @@ class MotionViewer:
             self.start_button.config(text="Başlat")
             self.select_button["state"] = "normal"
             
-    def _capture_loop(self):
-        while self.is_running:
-            ret, frame = self.cap.read()
-            if not ret:
-                self.is_running = False
-                break
-                
-            # Frame'i analiz motoruna gönder
-            self.analyzer.add_frame(frame)
-            
-            # İlerlemeyi güncelle
-            self.current_frame = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-            progress = (self.current_frame / self.frame_count) * 100
-            self.progress_var.set(progress)
-            
-            # FPS kontrolü (30fps)
-            time.sleep(1/30)
-            
     def _on_progress_change(self, value):
         if not self.is_running and self.video_path:
             # String'i float'a çevir
             value = float(value)
             # Frame numarasını hesapla
             self.current_frame = int((value / 100) * self.frame_count)
-            
-    def _update_gui(self):
-        if self.is_running:
-            # Görselleştirmeyi al
-            vis = self.analyzer.get_visualization()
-            
-            if vis is not None:
-                # OpenCV BGR -> RGB
-                rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
-                
-                # NumPy array -> PIL Image
-                image = Image.fromarray(rgb)
-                
-                # PIL Image -> Tkinter PhotoImage
-                photo = ImageTk.PhotoImage(image)
-                
-                # Görüntüyü güncelle
-                self.panel.config(image=photo)
-                self.panel.image = photo  # Referansı koru
-                
-            # GUI'yi 30ms sonra tekrar güncelle (yaklaşık 30 FPS)
-            self.root.after(30, self._update_gui)
             
     def _cleanup(self):
         self.is_running = False
@@ -203,10 +232,6 @@ class MotionViewer:
             self.cap.release()
             
         self.analyzer.stop_processing()
-        
-    def _on_closing(self):
-        self._cleanup()
-        self.root.destroy()
         
     def run(self):
         self.root.mainloop()

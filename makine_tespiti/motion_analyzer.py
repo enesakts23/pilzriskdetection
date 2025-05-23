@@ -40,10 +40,10 @@ class KalmanTracker:
         # İlk durum
         self.kf.x = np.array([[x], [y], [0], [0]])
         
-        # Hareket geçmişi
-        self.positions = deque(maxlen=30)
-        self.velocities = deque(maxlen=30)
-        self.filtered_velocities = deque(maxlen=30)
+        # Increase tracking history with no limits
+        self.positions = deque()  # No maxlen limit
+        self.velocities = deque()  # No maxlen limit
+        self.filtered_velocities = deque()  # No maxlen limit
         
     def update(self, x, y):
         # Ölçümü güncelle
@@ -68,11 +68,16 @@ class KalmanTracker:
 
 class MotionPattern:
     def __init__(self):
-        self.positions = deque(maxlen=60)  # 2 saniyelik veri (30fps)
-        self.velocities = deque(maxlen=60)
-        self.directions = deque(maxlen=60)
-        self.pattern_type = "BELİRSİZ"
-        self.confidence = 0.0
+        self.positions = deque()
+        self.velocities = deque()
+        self.directions = deque()
+        self.pattern_types = set()  # Tespit edilen tüm hareket tipleri
+        self.pattern_confidences = {}  # Her hareket tipi için güven değeri
+        
+        # Hareket analizi için parametreler
+        self.min_rotation_speed = 0.5  # Minimum dönme hızı (radyan/frame)
+        self.min_press_distance = 10.0  # Minimum press hareketi mesafesi (piksel)
+        self.camera_motion_threshold = 0.7  # Kamera hareketi filtreleme eşiği
         
     def add_measurement(self, pos, vel):
         self.positions.append(pos)
@@ -82,77 +87,123 @@ class MotionPattern:
             angle = np.arctan2(vel[1], vel[0])
             self.directions.append(angle)
             
+    def _detect_camera_motion(self, flow_vectors):
+        """Kamera hareketini tespit et"""
+        if len(flow_vectors) < 10:
+            return False
+            
+        mean_vector = np.mean(flow_vectors, axis=0)
+        mean_magnitude = np.linalg.norm(mean_vector)
+        
+        vector_angles = np.arctan2(flow_vectors[:, 1], flow_vectors[:, 0])
+        angle_std = np.std(vector_angles)
+        
+        return angle_std < 0.5 and mean_magnitude > self.camera_motion_threshold
+        
+    def _analyze_local_motion(self, positions, velocities):
+        """Yerel hareket analizi - birden fazla hareket tipi tespit edebilir"""
+        if len(positions) < 10:
+            return {}
+            
+        detected_patterns = {}
+        
+        # Pozisyon değişimlerini analiz et
+        pos_diff = np.diff(positions, axis=0)
+        vel_magnitudes = np.linalg.norm(velocities, axis=1)
+        
+        # ROTATING hareketi tespiti
+        if len(self.directions) >= 5:
+            recent_angles = np.array(list(self.directions)[-5:])
+            angle_diff = np.diff(recent_angles)
+            angle_diff = np.abs(np.unwrap(angle_diff))
+            
+            total_angle_change = np.sum(angle_diff)
+            mean_angular_velocity = total_angle_change / len(angle_diff)
+            
+            if (mean_angular_velocity > self.min_rotation_speed and
+                np.all(angle_diff > 0.1) and
+                np.std(pos_diff) < np.mean(vel_magnitudes)):
+                detected_patterns["ROTATING"] = min(mean_angular_velocity / np.pi, 1.0)
+                
+        # PRESS hareketi tespiti
+        vertical_movement = np.ptp(positions[:, 1])
+        horizontal_movement = np.ptp(positions[:, 0])
+        
+        if vertical_movement > self.min_press_distance:
+            y_diff = np.diff(positions[:, 1])
+            direction_changes = np.where(np.diff(np.signbit(y_diff)))[0]
+            
+            if (len(direction_changes) >= 2 and
+                vertical_movement > horizontal_movement * 1.5):
+                detected_patterns["PRESS"] = min(vertical_movement / 100.0, 1.0)
+                
+        return detected_patterns
+        
     def analyze_pattern(self):
-        if len(self.positions) < 30:  # En az 1 saniyelik veri
+        if len(self.positions) < 10:
             return "BELİRSİZ", 0.0
             
-        # Pozisyon analizi
         positions = np.array(list(self.positions))
         velocities = np.array(list(self.velocities))
         
-        # FFT ile frekans analizi
-        fft_x = np.fft.fft(positions[:, 0])
-        fft_y = np.fft.fft(positions[:, 1])
-        freqs = np.fft.fftfreq(len(positions))
-        
-        # Baskın frekansları bul
-        main_freq_x = abs(freqs[np.argmax(np.abs(fft_x[1:]))+1])
-        main_freq_y = abs(freqs[np.argmax(np.abs(fft_y[1:]))+1])
-        
-        # Hareket yönü analizi
-        mean_vel = np.mean(velocities, axis=0)
-        vel_magnitude = np.linalg.norm(mean_vel)
-        
-        # Yön değişimi analizi
-        if len(self.directions) >= 2:
-            direction_changes = np.diff(list(self.directions))
-            direction_changes = np.abs(np.unwrap(direction_changes))
+        # Kamera hareketi kontrolü
+        if self._detect_camera_motion(velocities):
+            return "BELİRSİZ", 0.0
             
-            # Periyodik hareket analizi
-            is_periodic = np.any(direction_changes > np.pi/2)
-            periodicity = np.std(direction_changes)
-        else:
-            is_periodic = False
-            periodicity = 0
-            
-        # Hareket tipi belirleme
-        if is_periodic and periodicity > 1.5:
-            # Dönme hareketi
-            pattern = "DÖNÜYOR"
-            conf = min(periodicity / 3.0, 1.0)
-            
-        elif main_freq_y > 0.1 and main_freq_y > main_freq_x * 2:
-            # Yukarı-aşağı hareket
-            y_amplitude = np.ptp(positions[:, 1])
-            if y_amplitude > 20:  # Minimum genlik kontrolü
-                pattern = "YUKARI-AŞAĞI"
-                conf = min(y_amplitude / 100.0, 1.0)
-            else:
-                pattern = "BELİRSİZ"
-                conf = 0.0
+        # Hareket bölgelerini bul
+        motion_regions = []
+        current_region = []
+        
+        for i, vel in enumerate(velocities):
+            if np.linalg.norm(vel) > 1.0:
+                current_region.append(i)
+            elif len(current_region) > 0:
+                motion_regions.append(current_region)
+                current_region = []
                 
-        elif main_freq_x > 0.1 and main_freq_x > main_freq_y * 2:
-            # Sağa-sola hareket
-            x_amplitude = np.ptp(positions[:, 0])
-            if x_amplitude > 20:
-                pattern = "SAĞA-SOLA"
-                conf = min(x_amplitude / 100.0, 1.0)
-            else:
-                pattern = "BELİRSİZ"
-                conf = 0.0
+        if len(current_region) > 0:
+            motion_regions.append(current_region)
+            
+        # Her bölgedeki hareketleri analiz et
+        all_patterns = {}
+        
+        for region in motion_regions:
+            if len(region) < 5:
+                continue
                 
-        elif vel_magnitude > 1.0:
-            # Karışık hareket
-            pattern = "KARIŞIK"
-            conf = min(vel_magnitude / 5.0, 1.0)
+            region_positions = positions[region]
+            region_velocities = velocities[region]
             
-        else:
-            pattern = "BELİRSİZ"
-            conf = 0.0
+            # Bölgedeki tüm hareket tiplerini al
+            patterns = self._analyze_local_motion(region_positions, region_velocities)
             
-        self.pattern_type = pattern
-        self.confidence = conf
-        return pattern, conf
+            # Her hareket tipini güncelle
+            for pattern, confidence in patterns.items():
+                if pattern not in all_patterns or confidence > all_patterns[pattern]:
+                    all_patterns[pattern] = confidence
+                    
+        # Sonuçları birleştir
+        if not all_patterns:
+            return "BELİRSİZ", 0.0
+            
+        # Tespit edilen tüm hareket tiplerini kaydet
+        self.pattern_types = set(all_patterns.keys())
+        self.pattern_confidences = all_patterns
+        
+        # En yüksek güvenilirliğe sahip hareketi döndür
+        best_pattern = max(all_patterns.items(), key=lambda x: x[1])
+        
+        # Eğer birden fazla hareket varsa, birleştir
+        if len(all_patterns) > 1:
+            patterns = "+".join(sorted(all_patterns.keys()))
+            confidence = np.mean(list(all_patterns.values()))
+            return patterns, confidence
+            
+        return best_pattern
+
+    def get_all_patterns(self):
+        """Tespit edilen tüm hareket tiplerini ve güven değerlerini döndür"""
+        return self.pattern_types, self.pattern_confidences
 
 class MotionRegion:
     def __init__(self, x, y, w, h):
@@ -198,14 +249,15 @@ class MotionRegion:
 
 class MotionAnalyzer:
     def __init__(self, save_dir="detected_motions"):
-        self.frame_queue = Queue(maxsize=300)
+        # Unlimited frame queue size for any video length
+        self.frame_queue = Queue()  # No maxsize limit
         self.processing = False
         self.current_frame = None
         self.prev_frame = None
         
-        # Motion history
-        self.history = deque(maxlen=90)  # 3 seconds history (30fps)
-        self.motion_vectors = deque(maxlen=90)
+        # Increase motion history size significantly
+        self.history = deque()  # No maxlen limit
+        self.motion_vectors = deque()  # No maxlen limit
         
         # Save directory for detected motions
         self.save_dir = save_dir
@@ -263,6 +315,15 @@ class MotionAnalyzer:
         self.motion_counts = Counter()
         self.most_frequent_motion = None
         self.most_frequent_motion_frame = None
+        
+        # Motion detection states and thresholds
+        self.current_motion = "BELİRSİZ"
+        self.motion_start_time = None
+        self.motion_frames = []
+        self.motion_confidence_threshold = 0.6
+        self.motion_duration_threshold = 15  # Minimum frame count for a valid motion
+        self.stable_motion_count = 0
+        self.last_saved_motion = None
         
     def _preprocess_frame(self, frame):
         """Frame preprocessing"""
@@ -426,16 +487,30 @@ class MotionAnalyzer:
             
             # Update motion tracking
             if direction != "UNCERTAIN" and direction != "UNKNOWN":
-                self.last_known_motion = direction
-                self.motion_counts[direction] += 1
+                # If this is a new motion pattern
+                if self.current_motion != direction:
+                    # If we were tracking a previous motion, save it if valid
+                    if self.current_motion != "BELİRSİZ" and len(self.motion_frames) >= self.motion_duration_threshold:
+                        self._save_motion_sequence()
+                    
+                    # Start tracking new motion
+                    self.current_motion = direction
+                    self.motion_start_time = time.time()
+                    self.motion_frames = [frame.copy()]
+                    self.stable_motion_count = 1
+                else:
+                    # Continue tracking current motion
+                    self.stable_motion_count += 1
+                    if len(self.motion_frames) < 100:  # Limit stored frames to prevent memory issues
+                        self.motion_frames.append(frame.copy())
+            else:
+                # If uncertain motion is detected and we were tracking a motion
+                if self.current_motion != "BELİRSİZ" and len(self.motion_frames) >= self.motion_duration_threshold:
+                    self._save_motion_sequence()
                 
-                # Update most frequent motion
-                if self.motion_counts[direction] > self.motion_counts.get(self.most_frequent_motion, 0):
-                    self.most_frequent_motion = direction
-                    # Save frame for most frequent motion
-                    self.most_frequent_motion_frame = frame.copy()
-                    # Save the image
-                    self._save_most_frequent_motion()
+                self.current_motion = "BELİRSİZ"
+                self.motion_frames = []
+                self.stable_motion_count = 0
             
             self.history.append(direction)
             
@@ -445,128 +520,61 @@ class MotionAnalyzer:
         
         return motion_info
         
-    def _save_most_frequent_motion(self):
-        """Save the frame with the most frequent motion and highlight significant moving regions"""
-        if self.most_frequent_motion and self.most_frequent_motion_frame is not None:
-            # Create a copy of the frame
-            save_frame = self.most_frequent_motion_frame.copy()
+    def _save_motion_sequence(self):
+        """Save the detected motion sequence"""
+        if not self.motion_frames or self.current_motion == "BELİRSİZ":
+            return
             
-            # Process the frame to detect motion
-            processed = self._preprocess_frame(save_frame)
-            current_gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
+        # Prevent saving the same motion pattern repeatedly
+        current_time = time.time()
+        if (self.last_saved_motion is not None and 
+            self.last_saved_motion[0] == self.current_motion and 
+            current_time - self.last_saved_motion[1] < 5):  # 5 second cooldown
+            return
             
-            # If prev_gray is not set, initialize it
-            if self.prev_gray is None:
-                self.prev_gray = current_gray
-                return
-            
-            # Calculate dense optical flow
-            flow = cv2.calcOpticalFlowFarneback(
-                self.prev_gray, 
-                current_gray,
-                None, 
-                **self.dense_flow_params
-            )
-            
-            # Calculate flow magnitude
-            magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-            
-            # Normalize magnitude to 0-255 range
-            magnitude_norm = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            
-            # Apply threshold to get significant motion areas
-            _, magnitude_mask = cv2.threshold(magnitude_norm, 30, 255, cv2.THRESH_BINARY)
-            
-            # Create motion mask if not available
-            if self.motion_mask is None:
-                self.motion_mask = self.bg_subtractor.apply(processed)
-            
-            # Combine with motion mask for better accuracy
-            motion_mask = self.motion_mask.copy()
-            combined_mask = cv2.bitwise_and(motion_mask, magnitude_mask)
-            
-            # Apply morphological operations to clean up the mask
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
-            combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
-            
-            # Find contours in the combined mask
-            contours, _ = cv2.findContours(
-                combined_mask,
-                cv2.RETR_EXTERNAL,
-                cv2.CHAIN_APPROX_SIMPLE
-            )
-            
-            # Create an empty mask for significant motion
-            significant_motion_mask = np.zeros_like(combined_mask)
-            
-            # Filter and process contours
-            if contours:
-                # Calculate average magnitude for each contour
-                contour_info = []
-                for contour in contours:
-                    area = cv2.contourArea(contour)
-                    if area > self.min_area:
-                        # Create mask for this contour
-                        contour_mask = np.zeros_like(combined_mask)
-                        cv2.drawContours(contour_mask, [contour], -1, 255, -1)
-                        
-                        # Calculate average magnitude in this contour
-                        mean_magnitude = cv2.mean(magnitude, mask=contour_mask)[0]
-                        contour_info.append((contour, area, mean_magnitude))
-                
-                if contour_info:
-                    # Sort contours by magnitude
-                    contour_info.sort(key=lambda x: x[2], reverse=True)
-                    
-                    # Take the top 3 contours with highest magnitude
-                    for contour, area, _ in contour_info[:3]:
-                        cv2.drawContours(significant_motion_mask, [contour], -1, 255, -1)
-            
-            # Create a colored overlay for the significant moving regions
-            overlay = save_frame.copy()
-            overlay[significant_motion_mask > 0] = [0, 255, 0]  # Green color for moving parts
-            
-            # Blend the original frame with the overlay
-            alpha = 0.4  # Transparency for visibility
-            save_frame = cv2.addWeighted(overlay, alpha, save_frame, 1 - alpha, 0)
-            
-            # Draw motion type text with background for better visibility
-            text = f"Motion Type: {self.most_frequent_motion}"
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 1.0
-            thickness = 2
-            color = (0, 255, 0)  # Green color
-            
-            # Get text size
-            (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-            
-            # Calculate text position (top-left corner)
-            x = 10
-            y = 40
-            
-            # Draw black background rectangle for text
-            cv2.rectangle(save_frame, 
-                        (x - 5, y - text_height - 5),
-                        (x + text_width + 5, y + 5),
-                        (0, 0, 0),
-                        -1)
-            
-            # Draw text
-            cv2.putText(save_frame,
-                       text,
-                       (x, y),
-                       font,
-                       font_scale,
-                       color,
-                       thickness)
-            
-            # Update prev_gray for next frame
-            self.prev_gray = current_gray
-            
-            # Save the modified frame
-            filename = os.path.join(self.save_dir, "most_frequent_motion.jpg")
-            cv2.imwrite(filename, save_frame)
+        # Create timestamp for filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Select representative frame (middle frame of sequence)
+        mid_idx = len(self.motion_frames) // 2
+        representative_frame = self.motion_frames[mid_idx].copy()
+        
+        # Add text overlay with motion type
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        text = f"Hareket: {self.current_motion}"
+        
+        # Get text size
+        text_size = cv2.getTextSize(text, font, 1, 2)[0]
+        
+        # Calculate text position
+        text_x = 10
+        text_y = text_size[1] + 20
+        
+        # Draw black background for text
+        cv2.rectangle(representative_frame, 
+                     (text_x - 5, text_y - text_size[1] - 5),
+                     (text_x + text_size[0] + 5, text_y + 5),
+                     (0, 0, 0),
+                     -1)
+        
+        # Draw text
+        cv2.putText(representative_frame,
+                   text,
+                   (text_x, text_y),
+                   font,
+                   1,
+                   (0, 255, 0),
+                   2)
+        
+        # Save the frame
+        filename = os.path.join(self.save_dir, f"motion_{self.current_motion}_{timestamp}.jpg")
+        cv2.imwrite(filename, representative_frame)
+        
+        # Update last saved motion
+        self.last_saved_motion = (self.current_motion, current_time)
+        
+        # Clear motion frames
+        self.motion_frames = []
         
     def get_visualization(self):
         """Visualization"""
@@ -610,8 +618,7 @@ class MotionAnalyzer:
             
     def add_frame(self, frame):
         """Add new frame"""
-        if not self.frame_queue.full():
-            self.frame_queue.put(frame)
+        self.frame_queue.put(frame)
             
     def _process_frames(self):
         """Frame processing loop"""
