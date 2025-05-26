@@ -249,6 +249,25 @@ class MotionRegion:
 
 class MotionAnalyzer:
     def __init__(self, save_dir="detected_motions"):
+        # GPU kullanılabilirlik kontrolü
+        self.use_gpu = False
+        try:
+            if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+                self.use_gpu = True
+                print("GPU detected! Using CUDA acceleration.")
+                # GPU stream oluştur
+                self.gpu_stream = cv2.cuda.Stream()
+                # GPU için gerekli nesneleri oluştur
+                self.gpu_bg_subtractor = cv2.cuda.createBackgroundSubtractorMOG2(
+                    history=500,
+                    varThreshold=16,
+                    detectShadows=False
+                )
+            else:
+                print("No GPU detected. Using CPU.")
+        except Exception as e:
+            print(f"Error initializing GPU: {e}. Using CPU.")
+
         # Unlimited frame queue size for any video length
         self.frame_queue = Queue()  # No maxsize limit
         self.processing = False
@@ -327,14 +346,49 @@ class MotionAnalyzer:
         
     def _preprocess_frame(self, frame):
         """Frame preprocessing"""
-        blurred = cv2.GaussianBlur(frame, (5, 5), 0)
-        return blurred
+        if self.use_gpu:
+            # Frame'i GPU'ya yükle
+            gpu_frame = cv2.cuda_GpuMat()
+            gpu_frame.upload(frame)
+            
+            # GPU üzerinde blur işlemi
+            gpu_blurred = cv2.cuda.GaussianBlur(gpu_frame, (5, 5), 0)
+            
+            # Sonucu CPU'ya geri al
+            blurred = gpu_blurred.download()
+            return blurred
+        else:
+            blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+            return blurred
         
     def _detect_background_motion(self, frame):
         """Background subtraction based motion detection"""
-        motion_mask = self.bg_subtractor.apply(frame)
-        motion_mask = cv2.erode(motion_mask, None, iterations=1)
-        motion_mask = cv2.dilate(motion_mask, None, iterations=2)
+        if self.use_gpu:
+            # Frame'i GPU'ya yükle
+            gpu_frame = cv2.cuda_GpuMat()
+            gpu_frame.upload(frame)
+            
+            # GPU üzerinde arkaplan çıkarma
+            gpu_motion_mask = self.gpu_bg_subtractor.apply(gpu_frame, learningRate=-1)
+            
+            # Maske'yi CPU'ya al
+            motion_mask = gpu_motion_mask.download()
+            
+            # Morfolojik işlemler için GPU
+            gpu_mask = cv2.cuda_GpuMat()
+            gpu_mask.upload(motion_mask)
+            
+            # Erosion ve dilation işlemleri
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            gpu_eroded = cv2.cuda.erode(gpu_mask, kernel)
+            gpu_dilated = cv2.cuda.dilate(gpu_eroded, kernel, iterations=2)
+            
+            # Son maske'yi CPU'ya al
+            motion_mask = gpu_dilated.download()
+        else:
+            motion_mask = self.bg_subtractor.apply(frame)
+            motion_mask = cv2.erode(motion_mask, None, iterations=1)
+            motion_mask = cv2.dilate(motion_mask, None, iterations=2)
         
         contours, _ = cv2.findContours(
             motion_mask,
@@ -359,6 +413,9 @@ class MotionAnalyzer:
         """Optical flow based motion detection"""
         if self.prev_gray is None:
             self.prev_gray = gray
+            if self.use_gpu:
+                self.gpu_prev_gray = cv2.cuda_GpuMat()
+                self.gpu_prev_gray.upload(gray)
             self.prev_points = cv2.goodFeaturesToTrack(
                 gray, mask=None, **self.feature_params
             )
@@ -370,12 +427,58 @@ class MotionAnalyzer:
             )
             if self.prev_points is None:
                 return None, None
-                
-        next_points, status, _ = cv2.calcOpticalFlowPyrLK(
-            self.prev_gray, gray,
-            self.prev_points, None,
-            **self.lk_params
-        )
+
+        if self.use_gpu:
+            # GPU'ya yükle
+            gpu_gray = cv2.cuda_GpuMat()
+            gpu_gray.upload(gray)
+            
+            # GPU üzerinde optik akış hesapla
+            gpu_flow = cv2.cuda_SparsePyrLKOpticalFlow.create(
+                winSize=(21, 21),
+                maxLevel=4,
+                iters=10
+            )
+            
+            gpu_prev_points = cv2.cuda_GpuMat()
+            gpu_prev_points.upload(self.prev_points)
+            
+            gpu_next_points = cv2.cuda_GpuMat()
+            gpu_status = cv2.cuda_GpuMat()
+            
+            gpu_flow.calc(self.gpu_prev_gray, gpu_gray, gpu_prev_points, 
+                         gpu_next_points, gpu_status, self.gpu_stream)
+            
+            # CPU'ya geri al
+            next_points = gpu_next_points.download()
+            status = gpu_status.download().flatten()
+            
+            # Dense optical flow için
+            gpu_flow_dense = cv2.cuda.FarnebackOpticalFlow.create(
+                numLevels=5,
+                pyrScale=0.5,
+                fastPyramids=False,
+                winSize=15,
+                numIters=3,
+                polyN=5,
+                polySigma=1.2,
+                flags=0
+            )
+            flow = gpu_flow_dense.calc(self.gpu_prev_gray, gpu_gray, None).download()
+            
+            # GPU belleği güncelle
+            self.gpu_prev_gray = gpu_gray
+        else:
+            next_points, status, _ = cv2.calcOpticalFlowPyrLK(
+                self.prev_gray, gray,
+                self.prev_points, None,
+                **self.lk_params
+            )
+            
+            flow = cv2.calcOpticalFlowFarneback(
+                self.prev_gray, gray,
+                None, **self.dense_flow_params
+            )
         
         if next_points is None:
             return None, None
@@ -386,11 +489,6 @@ class MotionAnalyzer:
         if len(good_new) < 3:
             return None, None
             
-        flow = cv2.calcOpticalFlowFarneback(
-            self.prev_gray, gray,
-            None, **self.dense_flow_params
-        )
-        
         motion_vectors = good_new - good_old
         mean_motion = np.mean(motion_vectors, axis=0)
         magnitude = np.linalg.norm(mean_motion)
@@ -615,6 +713,18 @@ class MotionAnalyzer:
         self.processing = False
         if hasattr(self, 'process_thread'):
             self.process_thread.join()
+            
+        # GPU kaynaklarını temizle
+        if self.use_gpu:
+            try:
+                if hasattr(self, 'gpu_stream'):
+                    self.gpu_stream.free()
+                if hasattr(self, 'gpu_prev_gray'):
+                    self.gpu_prev_gray.release()
+                cv2.cuda.deviceReset()
+                print("GPU resources cleaned up successfully.")
+            except Exception as e:
+                print(f"Error cleaning up GPU resources: {e}")
             
     def add_frame(self, frame):
         """Add new frame"""
