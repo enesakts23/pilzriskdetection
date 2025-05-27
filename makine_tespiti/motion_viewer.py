@@ -1,3 +1,4 @@
+# UYARI: Bu dosya sadece masaüstü arayüz (GUI) içindir, API tabanlı sunucu sistemlerde kullanılmaz.
 import cv2
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox

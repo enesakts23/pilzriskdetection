@@ -8,9 +8,6 @@ import os
 from datetime import datetime
 from filterpy.kalman import KalmanFilter
 from scipy.signal import savgol_filter
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from PIL import Image, ImageTk
 
 class KalmanTracker:
     def __init__(self, x, y):
